@@ -3,14 +3,15 @@
 import argparse
 import copy
 import itertools
+import os
 
 import torch
-from weight_shapes import WEIGHT_SHAPES
 
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import triton
+from weight_shapes import WEIGHT_SHAPES
 
 if not current_platform.has_device_capability(100):
     raise RuntimeError("NVFP4 requires compute capability of 10.0 (Blackwell)")
@@ -23,21 +24,40 @@ PROVIDER_CFGS = {
     "torch-bf16": dict(enabled=True),
     "nvfp4": dict(no_a_quant=False, enabled=True),
     "nvfp4-noquant": dict(no_a_quant=True, enabled=True),
+    "fbgemm-nvfp4": dict(fbgemm=True, no_a_quant=False, enabled=True),
+    "fbgemm-nvfp4-noquant": dict(fbgemm=True, no_a_quant=True, enabled=True),
 }
 
 _enabled = [k for k, v in PROVIDER_CFGS.items() if v["enabled"]]
 
+_needs_fbgemm = any(PROVIDER_CFGS[k].get("fbgemm", False) for k in _enabled)
+if _needs_fbgemm:
+    try:
+        from fbgemm_gpu.experimental.gemm.triton_gemm.fp4_quantize import (
+            triton_scale_nvfp4_quant,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "Failed to import fbgemm_gpu. This is required for fbgemm-enabled providers. "
+            "Please install fbgemm_gpu with: pip install fbgemm-gpu-genai\n"
+            "For more information, see: https://github.com/pytorch/FBGEMM/releases"
+        ) from e
 
-def _quant_weight_nvfp4(b: torch.Tensor, device: str):
+
+def _quant_weight_nvfp4(cfg, b: torch.Tensor, device: str):
     # Compute global scale for weight
     b_amax = torch.abs(b).max().to(torch.float32)
     b_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / b_amax
-    b_fp4, scale_b_fp4 = ops.scaled_fp4_quant(b, b_global_scale)
+    if "fbgemm" in cfg and cfg["fbgemm"]:
+        b_fp4, scale_b_fp4 = triton_scale_nvfp4_quant(b, b_global_scale)
+    else:
+        b_fp4, scale_b_fp4 = ops.scaled_fp4_quant(b, b_global_scale)
+    # print(f"{b_fp4.dtype=} {scale_b_fp4.dtype=}", cfg)
     return b_fp4, scale_b_fp4, b_global_scale
 
 
 def build_nvfp4_runner(cfg, a, b, dtype, device):
-    b_fp4, scale_b_fp4, b_global_scale = _quant_weight_nvfp4(b, device)
+    b_fp4, scale_b_fp4, b_global_scale = _quant_weight_nvfp4(cfg, b, device)
 
     # Compute global scale for activation
     # NOTE: This is generally provided ahead-of-time by the model checkpoint.
@@ -46,6 +66,36 @@ def build_nvfp4_runner(cfg, a, b, dtype, device):
 
     # Alpha for the GEMM operation
     alpha = 1.0 / (a_global_scale * b_global_scale)
+
+    if "fbgemm" in cfg and cfg["fbgemm"]:
+        if cfg["no_a_quant"]:
+            a_fp4, scale_a_fp4 = triton_scale_nvfp4_quant(a, a_global_scale)
+
+            def run():
+                return torch.ops.fbgemm.f4f4bf16(
+                    a_fp4,
+                    b_fp4,
+                    scale_a_fp4,
+                    scale_b_fp4,
+                    global_scale=alpha,
+                    use_mx=False,
+                )
+
+            return run
+        else:
+
+            def run():
+                a_fp4, scale_a_fp4 = triton_scale_nvfp4_quant(a, a_global_scale)
+                return torch.ops.fbgemm.f4f4bf16(
+                    a_fp4,
+                    b_fp4,
+                    scale_a_fp4,
+                    scale_b_fp4,
+                    global_scale=alpha,
+                    use_mx=False,
+                )
+
+            return run
 
     if cfg["no_a_quant"]:
         # Pre-quantize activation
@@ -72,7 +122,8 @@ def build_nvfp4_runner(cfg, a, b, dtype, device):
     triton.testing.Benchmark(
         x_names=["batch_size"],
         x_vals=[1, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
-        x_log=False,
+        x_log=True,
+        y_log=True,
         line_arg="provider",
         line_vals=_enabled,
         line_names=_enabled,
@@ -129,6 +180,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     for K, N, model in prepare_shapes(args):
+        save_dir = f"bench_nvfp4_res_n{N}_k{K}"
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            print(f"Created/verified directory: {save_dir}")
+        except OSError as e:
+            print(f"Error creating directory {save_dir}. Check permissions. Error: {e}")
+            # Consider skipping this shape if directory creation fails completely
+            continue
+
         print(f"{model}, N={N} K={K}, BF16 vs NVFP4 GEMMs TFLOP/s:")
         benchmark.run(
             print_data=True,
