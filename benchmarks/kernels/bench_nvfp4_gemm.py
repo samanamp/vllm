@@ -48,11 +48,11 @@ def _quant_weight_nvfp4(cfg, b: torch.Tensor, device: str):
     # Compute global scale for weight
     b_amax = torch.abs(b).max().to(torch.float32)
     b_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / b_amax
-    if "fbgemm" in cfg and cfg["fbgemm"]:
-        b_fp4, scale_b_fp4 = triton_scale_nvfp4_quant(b, b_global_scale)
-    else:
-        b_fp4, scale_b_fp4 = ops.scaled_fp4_quant(b, b_global_scale)
-    # print(f"{b_fp4.dtype=} {scale_b_fp4.dtype=}", cfg)
+    # if "fbgemm" in cfg and cfg["fbgemm"]:
+    #     b_fp4, scale_b_fp4 = triton_scale_nvfp4_quant(b, b_global_scale)
+    # else:
+    b_fp4, scale_b_fp4 = ops.scaled_fp4_quant(b, b_global_scale)
+    # print(f"{b_fp4.shape=}{b_fp4.dtype} {scale_b_fp4.shape=}{scale_b_fp4.dtype}", cfg)
     return b_fp4, scale_b_fp4, b_global_scale
 
 
@@ -68,8 +68,12 @@ def build_nvfp4_runner(cfg, a, b, dtype, device):
     alpha = 1.0 / (a_global_scale * b_global_scale)
 
     if "fbgemm" in cfg and cfg["fbgemm"]:
+        scale_b_fp4 = scale_b_fp4.view(-1).view(torch.uint8)
+
         if cfg["no_a_quant"]:
-            a_fp4, scale_a_fp4 = triton_scale_nvfp4_quant(a, a_global_scale)
+            # a_fp4, scale_a_fp4 = triton_scale_nvfp4_quant(a, a_global_scale)
+            a_fp4, scale_a_fp4 = ops.scaled_fp4_quant(a, a_global_scale)
+            scale_a_fp4 = scale_a_fp4.view(-1).view(torch.uint8)
 
             def run():
                 return torch.ops.fbgemm.f4f4bf16(
@@ -85,7 +89,9 @@ def build_nvfp4_runner(cfg, a, b, dtype, device):
         else:
 
             def run():
-                a_fp4, scale_a_fp4 = triton_scale_nvfp4_quant(a, a_global_scale)
+                # a_fp4, scale_a_fp4 = triton_scale_nvfp4_quant(a, a_global_scale)
+                a_fp4, scale_a_fp4 = ops.scaled_fp4_quant(a, a_global_scale)
+                scale_a_fp4 = scale_a_fp4.view(-1).view(torch.uint8)
                 return torch.ops.fbgemm.f4f4bf16(
                     a_fp4,
                     b_fp4,
